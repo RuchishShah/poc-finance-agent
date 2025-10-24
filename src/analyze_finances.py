@@ -16,6 +16,21 @@ from config import config
 from utils import CSVValidator, DataFormatter, ReportGenerator, DataValidationError
 
 
+class CreditBalanceError(Exception):
+    """Raised when Anthropic account has insufficient credits."""
+    pass
+
+
+class AuthenticationError(Exception):
+    """Raised when API key is invalid or expired."""
+    pass
+
+
+class RateLimitError(Exception):
+    """Raised when API rate limit is exceeded."""
+    pass
+
+
 class FinanceAgent:
     """Main finance analysis agent using Claude AI."""
     
@@ -140,7 +155,7 @@ Please analyze the following transaction data and provide a comprehensive financ
             self.logger.info("Sending transaction data to Claude for analysis...")
             
             response = self.client.messages.create(
-                model="claude-3-5-sonnet-20240620",
+                model="claude-3-5-sonnet-latest",
                 max_tokens=2000,
                 temperature=0.3,
                 system=system_prompt,
@@ -154,10 +169,52 @@ Please analyze the following transaction data and provide a comprehensive financ
             return analysis
             
         except Exception as e:
+            error_msg = str(e)
             self.logger.error(f"Error getting Claude analysis: {e}")
-            raise
+            
+            # Handle specific API errors with helpful messages
+            if "credit balance is too low" in error_msg:
+                raise CreditBalanceError("Insufficient credits in your Anthropic account")
+            elif "authentication_error" in error_msg:
+                raise AuthenticationError("Invalid or expired API key")
+            elif "rate_limit" in error_msg:
+                raise RateLimitError("API rate limit exceeded")
+            else:
+                raise
     
-    def run_analysis(self, use_sample_data: bool = False, save_report: bool = True) -> Dict[str, Any]:
+    def generate_basic_analysis(self, breakdown: Dict[str, Any]) -> str:
+        """Generate basic analysis without Claude API when credits are insufficient."""
+        summary = breakdown.get('summary', {})
+        categories = breakdown.get('categories', {})
+        
+        analysis = "## Basic Financial Analysis (Generated Locally)\n\n"
+        
+        # Summary
+        analysis += f"**Total Income:** ${summary.get('total_income', 0):,.2f}\n"
+        analysis += f"**Total Spent:** ${summary.get('total_spent', 0):,.2f}\n"
+        analysis += f"**Net Cash Flow:** ${summary.get('net_flow', 0):,.2f}\n\n"
+        
+        # Top categories
+        if categories:
+            analysis += "### Top Spending Categories:\n"
+            for i, (category, data) in enumerate(list(categories.items())[:3], 1):
+                analysis += f"{i}. **{category}**: ${data['total']:,.2f} ({data['percentage']:.1f}% of spending)\n"
+            
+            analysis += "\n### Observations:\n"
+            if summary.get('net_flow', 0) > 0:
+                analysis += "✅ Positive cash flow - you're saving money!\n"
+            else:
+                analysis += "⚠️ Negative cash flow - spending exceeds income\n"
+            
+            top_category = list(categories.keys())[0] if categories else "Unknown"
+            analysis += f"💰 Largest expense category: {top_category}\n"
+            analysis += f"📊 Tracked {summary.get('transaction_count', 0)} transactions\n"
+        
+        analysis += "\n*Note: This is a basic analysis. Add credits to your Anthropic account for AI-powered insights and recommendations.*"
+        
+        return analysis
+    
+    def run_analysis(self, use_sample_data: bool = False, save_report: bool = True, fallback_on_error: bool = True) -> Dict[str, Any]:
         """Run the complete financial analysis workflow."""
         try:
             # Determine which file to use
@@ -175,8 +232,16 @@ Please analyze the following transaction data and provide a comprehensive financ
             # Calculate spending breakdown
             breakdown = DataFormatter.calculate_spending_breakdown(df)
             
-            # Get Claude analysis
-            analysis = self.analyze_with_claude(transactions_text)
+            # Try to get Claude analysis
+            analysis = None
+            try:
+                analysis = self.analyze_with_claude(transactions_text)
+            except (CreditBalanceError, AuthenticationError, RateLimitError) as api_error:
+                if fallback_on_error:
+                    self.logger.warning(f"Claude API unavailable ({api_error}), generating basic analysis")
+                    analysis = self.generate_basic_analysis(breakdown)
+                else:
+                    raise api_error
             
             # Generate and save report if requested
             report_path = None
@@ -192,7 +257,8 @@ Please analyze the following transaction data and provide a comprehensive financ
                 'analysis': analysis,
                 'breakdown': breakdown,
                 'file_info': file_info,
-                'report_path': report_path
+                'report_path': report_path,
+                'used_fallback': analysis and "Basic Financial Analysis" in analysis
             }
             
         except Exception as e:
@@ -211,11 +277,15 @@ def main():
         
         # Run analysis
         print("📊 Analyzing your financial transactions...")
-        results = agent.run_analysis(use_sample_data=True, save_report=True)
+        results = agent.run_analysis(use_sample_data=True, save_report=True, fallback_on_error=True)
         
         # Display results
         print("\n" + "=" * 50)
-        print("💰 FINANCIAL ANALYSIS REPORT")
+        if results.get('used_fallback'):
+            print("📊 BASIC FINANCIAL ANALYSIS REPORT")
+            print("(Add credits for AI-powered insights)")
+        else:
+            print("🤖 AI FINANCIAL ANALYSIS REPORT")
         print("=" * 50)
         print(results['analysis'])
         print("\n" + "=" * 50)
@@ -230,6 +300,12 @@ def main():
         if results['report_path']:
             print(f"📄 Report saved: {results['report_path']}")
         
+        # Show credit message if using fallback
+        if results.get('used_fallback'):
+            print("\n💡 To get AI-powered insights:")
+            print("   1. Add credits: https://console.anthropic.com/settings/billing")
+            print("   2. Run analysis again for personalized recommendations")
+        
         print("✅ Analysis complete!")
         
     except FileNotFoundError as e:
@@ -237,8 +313,30 @@ def main():
         print("💡 Make sure your transaction CSV file exists in the data/ directory")
         sys.exit(1)
         
+    except CreditBalanceError as e:
+        print(f"\n💳 Credit Balance Error: {e}")
+        print("💡 Steps to fix:")
+        print("   1. Go to: https://console.anthropic.com/settings/billing")
+        print("   2. Add credits to your account ($5 minimum)")
+        print("   3. Run the analysis again")
+        print(f"   💰 Estimated cost per analysis: ~$0.05")
+        sys.exit(1)
+        
+    except AuthenticationError as e:
+        print(f"\n🔑 Authentication Error: {e}")
+        print("💡 Steps to fix:")
+        print("   1. Check your API key at: https://console.anthropic.com/")
+        print("   2. Update your .env file with the correct key")
+        print("   3. Make sure the key starts with 'sk-ant-api03-'")
+        sys.exit(1)
+        
+    except RateLimitError as e:
+        print(f"\n⏰ Rate Limit Error: {e}")
+        print("💡 Please wait a few minutes and try again")
+        sys.exit(1)
+        
     except DataValidationError as e:
-        print(f"\n❌ Data Validation Error: {e}")
+        print(f"\n📊 Data Validation Error: {e}")
         print("💡 Check your CSV file format and required columns")
         sys.exit(1)
         
