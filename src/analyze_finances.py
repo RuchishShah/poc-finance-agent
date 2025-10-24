@@ -9,8 +9,11 @@ import pandas as pd
 import sys
 from pathlib import Path
 from anthropic import Anthropic
+from datetime import datetime
+from typing import Dict, Any, Tuple
 
 from config import config
+from utils import CSVValidator, DataFormatter, ReportGenerator, DataValidationError
 
 
 class FinanceAgent:
@@ -20,9 +23,12 @@ class FinanceAgent:
         """Initialize the finance agent with Claude client."""
         self.logger = logging.getLogger(__name__)
         self.client = Anthropic(api_key=config.anthropic_api_key)
+        self.validator = CSVValidator()
+        self.formatter = DataFormatter()
+        self.report_generator = ReportGenerator()
         self.logger.info("Finance Agent initialized successfully")
     
-    def load_transactions(self, file_path: Path) -> pd.DataFrame:
+    def load_transactions(self, file_path: Path) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         """Load and validate transaction data from CSV file."""
         try:
             if not file_path.exists():
@@ -32,28 +38,45 @@ class FinanceAgent:
             df = pd.read_csv(file_path)
             self.logger.info(f"Loaded {len(df)} transactions from {file_path}")
             
-            # Validate required columns
-            required_columns = ['Date', 'Description', 'Amount', 'Type']
-            missing_columns = [col for col in required_columns if col not in df.columns]
+            # Validate CSV structure and quality
+            validation_results = self.validator.validate_csv_structure(df)
             
-            if missing_columns:
-                raise ValueError(f"Missing required columns: {missing_columns}")
+            # Log validation warnings
+            for warning in validation_results.get('warnings', []):
+                self.logger.warning(warning)
             
-            # Convert date column
-            df['Date'] = pd.to_datetime(df['Date'])
+            # Raise errors if validation failed
+            if not validation_results['is_valid']:
+                error_msg = '; '.join(validation_results['errors'])
+                raise DataValidationError(f"CSV validation failed: {error_msg}")
             
-            # Ensure Amount is numeric
-            df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce')
+            # Clean and validate the data
+            df_clean = self.validator.clean_and_validate_data(df)
             
-            # Remove rows with invalid data
-            df = df.dropna(subset=['Amount'])
+            # Prepare file info for reporting
+            file_info = {
+                'filename': file_path.name,
+                'transaction_count': len(df_clean),
+                'date_range': self._get_date_range(df_clean),
+                'validation_results': validation_results
+            }
             
-            self.logger.info(f"Successfully validated {len(df)} transactions")
-            return df
+            self.logger.info(f"Successfully processed {len(df_clean)} valid transactions")
+            return df_clean, file_info
             
         except Exception as e:
             self.logger.error(f"Error loading transactions: {e}")
             raise
+    
+    def _get_date_range(self, df: pd.DataFrame) -> str:
+        """Get formatted date range from transaction data."""
+        if df.empty or 'Date' not in df.columns:
+            return "Unknown"
+        
+        min_date = df['Date'].min()
+        max_date = df['Date'].max()
+        
+        return DataFormatter.format_date_range(min_date, max_date)
     
     def format_transactions_for_analysis(self, df: pd.DataFrame) -> str:
         """Format transaction data for Claude analysis."""
@@ -117,7 +140,7 @@ Please analyze the following transaction data and provide a comprehensive financ
             self.logger.info("Sending transaction data to Claude for analysis...")
             
             response = self.client.messages.create(
-                model="claude-3-5-sonnet-20241022",
+                model="claude-3-5-sonnet-20240620",
                 max_tokens=2000,
                 temperature=0.3,
                 system=system_prompt,
@@ -134,7 +157,7 @@ Please analyze the following transaction data and provide a comprehensive financ
             self.logger.error(f"Error getting Claude analysis: {e}")
             raise
     
-    def run_analysis(self, use_sample_data: bool = False) -> str:
+    def run_analysis(self, use_sample_data: bool = False, save_report: bool = True) -> Dict[str, Any]:
         """Run the complete financial analysis workflow."""
         try:
             # Determine which file to use
@@ -146,13 +169,31 @@ Please analyze the following transaction data and provide a comprehensive financ
                 self.logger.info("Using user transaction data")
             
             # Load and process transactions
-            df = self.load_transactions(file_path)
+            df, file_info = self.load_transactions(file_path)
             transactions_text = self.format_transactions_for_analysis(df)
+            
+            # Calculate spending breakdown
+            breakdown = DataFormatter.calculate_spending_breakdown(df)
             
             # Get Claude analysis
             analysis = self.analyze_with_claude(transactions_text)
             
-            return analysis
+            # Generate and save report if requested
+            report_path = None
+            if save_report:
+                report_content = self.report_generator.generate_report(
+                    analysis, breakdown, file_info
+                )
+                report_path = self.report_generator.save_report(
+                    report_content, config.reports_dir
+                )
+            
+            return {
+                'analysis': analysis,
+                'breakdown': breakdown,
+                'file_info': file_info,
+                'report_path': report_path
+            }
             
         except Exception as e:
             self.logger.error(f"Analysis failed: {e}")
@@ -170,19 +211,35 @@ def main():
         
         # Run analysis
         print("📊 Analyzing your financial transactions...")
-        analysis = agent.run_analysis(use_sample_data=True)
+        results = agent.run_analysis(use_sample_data=True, save_report=True)
         
         # Display results
         print("\n" + "=" * 50)
         print("💰 FINANCIAL ANALYSIS REPORT")
         print("=" * 50)
-        print(analysis)
+        print(results['analysis'])
         print("\n" + "=" * 50)
+        
+        # Show summary statistics
+        summary = results['breakdown']['summary']
+        print(f"📈 Summary: {DataFormatter.format_currency(summary['total_income'])} income, "
+              f"{DataFormatter.format_currency(summary['total_spent'])} spent, "
+              f"{DataFormatter.format_currency(summary['net_flow'])} net flow")
+        
+        # Show report save location
+        if results['report_path']:
+            print(f"📄 Report saved: {results['report_path']}")
+        
         print("✅ Analysis complete!")
         
     except FileNotFoundError as e:
         print(f"\n❌ File Error: {e}")
         print("💡 Make sure your transaction CSV file exists in the data/ directory")
+        sys.exit(1)
+        
+    except DataValidationError as e:
+        print(f"\n❌ Data Validation Error: {e}")
+        print("💡 Check your CSV file format and required columns")
         sys.exit(1)
         
     except ValueError as e:
