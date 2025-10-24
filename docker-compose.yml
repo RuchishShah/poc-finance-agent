@@ -1,0 +1,11 @@
+services:
+  finance-agent:
+    build: .
+    container_name: finance-agent
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    volumes:
+      - ./data:/app/data
+      - ./reports:/app/reports
+      - ./src:/app/src
+    command: python src/analyze_finances.py
